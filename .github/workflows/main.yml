@@ -1,0 +1,238 @@
+name: AutomationWorkflow
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'  # 每12小时运行一次
+  workflow_dispatch:      # 允许手动触发
+
+permissions:
+  contents: write
+  
+# 关键：固定并发组名为仓库标识，确保所有实例同属一组
+concurrency:
+  group: ${{ github.repository }}  # 用仓库名作为全局唯一并发组（如 "owner/repo"）
+  cancel-in-progress: false  # 新实例等待旧实例完成，不取消正在运行的
+
+jobs:
+  run-and-release:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          # 程序1：sordum
+          - program_base: "sordum"
+            index: 0
+            last_index: 0
+                      
+    steps:
+      # 步骤：拉取仓库代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取所有历史以获取完整tag列表
+      
+      # 步骤：将所有标签写入tags.txt文件
+      - name: 导出标签到tags.txt
+        run: |
+          # 使用git tag命令获取所有标签（按字母顺序），并写入tags.txt
+          git tag > sordum.AllTags.txt
+        shell: bash  # 指定使用bash shell执行命令（确保跨环境兼容性）
+      
+      # 步骤：运行sordum.exe
+      - name: Run sordum.exe
+        run: |
+          .\sordum.exe
+        working-directory: ${{ github.workspace }}  # 仓库根目录
+
+      # 步骤：读取sordum.tag.txt内容
+      - name: Read version tag from file
+        id: read_version
+        run: |
+          $version = Get-Content .\sordum.tag.txt -Raw
+          $version = $version.Trim()  # 移除空白字符（包括换行符）
+          echo "version_tag=$version" >> $env:GITHUB_OUTPUT
+        working-directory: ${{ github.workspace }}
+
+      # 步骤：检查标签是不是空的，如果是则退出
+      - name: Check if version is empty
+        if: steps.read_version.outputs.version_tag == ''
+        run: |
+          Write-Error "sordum.tag.txt is empty. Exiting workflow."
+          exit 1
+  
+      # 步骤：检查标签是不是已存在
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          $tag = "${{ steps.read_version.outputs.version_tag }}"
+          $tags = git tag --list $tag
+          if ($tags -contains $tag) {
+            echo "tag_exists=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "tag_exists=false" >> $env:GITHUB_OUTPUT
+          }
+      
+      # 步骤：如果标签已存在则退出
+      - name: Exit if tag exists
+        if: steps.check_tag.outputs.tag_exists == 'true'
+        run: |
+          Write-Host "Tag ${{ steps.read_version.outputs.version_tag }} already exists. Exiting workflow."
+          exit 0
+          
+      # 步骤3：读取程序专属的标签和标题文件
+      - name: 读取 ${{ matrix.program_base }} 的标签和标题
+        id: read_info
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        run: |
+          $programBase = "${{ matrix.program_base }}"
+          # 定义专属文件名（程序名.tag.txt 和 程序名.title.txt）
+          $tagFile = "$programBase.tag.txt"
+          $titleFile = "$programBase.title.txt"
+          
+          # 1. 检查文件是否存在
+          if (-not (Test-Path $tagFile -PathType Leaf)) {
+            Write-Error "标签文件 $tagFile 不存在，请检查程序是否正常生成"
+            exit 1
+          }
+          if (-not (Test-Path $titleFile -PathType Leaf)) {
+            Write-Error "标题文件 $titleFile 不存在，请检查程序是否正常生成"
+            exit 1
+          }
+          
+          # 2. 安全读取文件内容（避免空值错误）
+          $tagContent = (Get-Content $tagFile -Raw).Trim()
+          $titleContent = (Get-Content $titleFile -Raw).Trim()
+          
+          # 3. 验证内容不为空
+          if ([string]::IsNullOrWhiteSpace($tagContent)) {
+            Write-Error "$tagFile 内容为空，请检查程序输出"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($titleContent)) {
+            Write-Error "$titleFile 内容为空，请检查程序输出"
+            exit 1
+          }
+          
+          # 4. 输出到环境变量供后续步骤使用
+          echo "tag=$tagContent" >> $env:GITHUB_OUTPUT
+          echo "title=$titleContent" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      # 步骤5：计算发布时间（修复换行符，确保分行显示）
+      - name: 计算发布时间（分行显示）
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        shell: bash
+        run: |
+          # 1. 获取两种时间（同时修复 CUT 时区为标准 UTC）
+          LOCAL_TIME=$(date +"%Y-%m-%d %H:%M:%S %Z")
+          UTC_TIME=$(TZ=UTC date +"%Y-%m-%d %H:%M:%S UTC")
+          
+          # 2. 用 $'\n' 生成真实换行，按格式拼接内容
+          # 结构：第一行加粗“发布时间”，第二行本地时间，第三行UTC时间
+          RELEASE_TIME_CONTENT="**自动发布于**"$'\n'"本地时间：$LOCAL_TIME"$'\n'"UTC 时间：$UTC_TIME"
+          
+          # 3. 用 Here Document 写入环境变量（避免换行符被转义）
+          echo "RELEASE_TIME<<EOF" >> $GITHUB_ENV
+          echo "$RELEASE_TIME_CONTENT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      # 步骤：计算文件哈希值（大写+无乱码）+ 生成hash.txt
+      - name: 计算文件哈希值（大写+无乱码）并生成hash.txt
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        shell: bash
+        env:
+          LC_ALL: en_US.UTF-8
+        run: |
+          # 检查downloading目录是否存在且有文件
+          if [ ! -d "./downloading" ] || [ -z "$(ls -A ./downloading)" ]; then
+            echo "Error: downloading目录不存在或为空"
+            exit 1
+          fi
+          
+          # 初始化哈希信息（用于Release body）
+          HASH_INFO="### File Checksums"
+          # 初始化hash.txt内容（包含头部信息）
+          HASH_TXT_CONTENT="=== File Hash Checksum (${{ matrix.program_base }}) ==="
+          HASH_TXT_CONTENT+=$'\n发布时间（本地）: '"$(date +"%Y-%m-%d %H:%M:%S %Z")"
+          HASH_TXT_CONTENT+=$'\n发布时间（UTC）: '"$(TZ=UTC date +"%Y-%m-%d %H:%M:%S UTC")"
+          HASH_TXT_CONTENT+=$'\n版本标签: ${{ steps.read_info.outputs.tag }}'
+          HASH_TXT_CONTENT+=$'\n==============================================='
+          
+          for file in ./downloading/*; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              # 跳过hash.txt本身（避免循环处理）
+              if [ "$filename" = "hash.txt" ]; then
+                continue
+              fi
+              
+              # 计算各种哈希值
+              md5_val=$(openssl md5 -hex "$file" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+              sha1_val=$(openssl sha1 -hex "$file" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+              sha256_val=$(openssl sha256 -hex "$file" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+              sha512_val=$(openssl sha512 -hex "$file" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+              
+              # 更新Release body的哈希信息
+              HASH_INFO+=$'\n\n#### '"$filename"
+              HASH_INFO+=$'\nMD5: '"$md5_val"
+              HASH_INFO+=$'\nSHA1: '"$sha1_val"
+              HASH_INFO+=$'\nSHA256: '"$sha256_val"
+              HASH_INFO+=$'\nSHA512: '"$sha512_val"
+              
+              # 更新hash.txt的内容（更易读的格式）
+              HASH_TXT_CONTENT+=$'\n\n[文件] '"$filename"
+              HASH_TXT_CONTENT+=$'\nMD5    : '"$md5_val"
+              HASH_TXT_CONTENT+=$'\nSHA1   : '"$sha1_val"
+              HASH_TXT_CONTENT+=$'\nSHA256 : '"$sha256_val"
+              HASH_TXT_CONTENT+=$'\nSHA512 : '"$sha512_val"
+            fi
+          done
+          
+          # 添加尾部信息到hash.txt
+          HASH_TXT_CONTENT+=$'\n\n==============================================='
+          HASH_TXT_CONTENT+=$'\n提示：请验证下载文件的哈希值以确保文件完整性'
+          
+          # 1. 写入哈希信息到环境变量（供Release body使用）
+          echo "HASH_INFO<<EOF" >> $GITHUB_ENV
+          echo "$HASH_INFO" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          # 2. 生成hash.txt文件到downloading目录（随资产发布）
+          echo "$HASH_TXT_CONTENT" > ./downloading/hash.txt
+          echo "已生成hash.txt文件，包含所有发布文件的哈希值"
+          echo "hash.txt路径：./downloading/hash.txt"
+          # 验证文件是否生成成功
+          if [ -f "./downloading/hash.txt" ]; then
+            echo "hash.txt生成成功，文件大小：$(du -sh ./downloading/hash.txt | awk '{print $1}')"
+          else
+            echo "Error: hash.txt生成失败"
+            exit 1
+          fi
+
+      # 步骤5：发布Release（同时显示两个时间）
+      - name: 发布 ${{ matrix.program_base }} 到 Release
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.read_info.outputs.tag }}
+          name: ${{ steps.read_info.outputs.title }}
+          files: ./downloading/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 步骤：清理下载目录（非最后一个程序时执行）
+      - name: 清理下载文件夹
+        if: ${{ matrix.index != matrix.last_index }}
+        run: |
+          if (Test-Path ./downloading) {
+            # 先检查目录是否有文件
+            if (Get-ChildItem ./downloading -ErrorAction SilentlyContinue) {
+              Remove-Item ./downloading/* -Recurse -Force
+              Write-Host "已清理 downloading 文件夹，准备处理下一个程序"
+            } else {
+              Write-Host "downloading 文件夹已为空，无需清理"
+            }
+          } else {
+            Write-Host "downloading 文件夹不存在，无需清理"
+          }
+        shell: pwsh
